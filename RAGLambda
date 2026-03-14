@@ -1,0 +1,233 @@
+
+import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+import { BedrockRuntimeClient, InvokeModelWithResponseStreamCommand } from '@aws-sdk/client-bedrock-runtime';
+
+const s3Client = new S3Client({});
+const bedrockClient = new BedrockRuntimeClient({});
+
+export const handler = awslambda.streamifyResponse(async (event, responseStream, context) => {
+  const requestId = context.awsRequestId;
+  const startTime = Date.now();
+  console.log(`[${requestId}] Lambda invoked`, {
+    httpMethod: event.httpMethod,
+    path: event.path,
+    sourceIp: event.requestContext?.identity?.sourceIp,
+    userAgent: event.headers?.['User-Agent'],
+    remainingTimeMs: context.getRemainingTimeInMillis()
+  });
+
+  const corsHeaders = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Methods": "POST, OPTIONS"
+  };
+
+  // Handle CORS preflight
+  if (event.httpMethod === 'OPTIONS') {
+    responseStream = awslambda.HttpResponseStream.from(responseStream, {
+      statusCode: 200,
+      headers: { ...corsHeaders }
+    });
+    responseStream.end();
+    return;
+  }
+
+  try {
+    const bucketName = process.env.BUCKET_NAME;
+    const fileKey = process.env.FILE_KEY;
+    const modelId = process.env.MODEL_ID || 'anthropic.claude-3-sonnet-20240229-v1:0';
+
+    console.log(`[${requestId}] Config`, { bucketName, fileKey, modelId });
+
+    if (!bucketName || !fileKey) {
+      console.error(`[${requestId}] Missing env vars`, { bucketName: !!bucketName, fileKey: !!fileKey });
+      
+      // Set error response metadata
+      responseStream = awslambda.HttpResponseStream.from(responseStream, {
+        statusCode: 400,
+        headers: { "Content-Type": "application/json", ...corsHeaders }
+      });
+      
+      responseStream.write(JSON.stringify({
+        error: 'Missing required environment variables: BUCKET_NAME or FILE_KEY'
+      }));
+      responseStream.end();
+      return;
+    }
+
+    // Parse request body
+    console.log(`[${requestId}] Parsing request body`, { bodyLength: event.body?.length, isBase64Encoded: event.isBase64Encoded });
+    const body = JSON.parse(event.body || '{}');
+    const { prompt, conversation_history = [] } = body;
+
+    if (!prompt) {
+      console.warn(`[${requestId}] Missing prompt in request body`, { bodyKeys: Object.keys(body) });
+      
+      // Set error response metadata
+      responseStream = awslambda.HttpResponseStream.from(responseStream, {
+        statusCode: 400,
+        headers: { "Content-Type": "application/json", ...corsHeaders }
+      });
+      
+      responseStream.write(JSON.stringify({
+        error: 'Missing required parameter: prompt'
+      }));
+      responseStream.end();
+      return;
+    }
+
+    console.log(`[${requestId}] Request parsed`, {
+      promptLength: prompt.length,
+      promptPreview: prompt.substring(0, 100),
+      historyLength: conversation_history.length,
+      historyRoles: conversation_history.map(m => m.role)
+    });
+
+    // Download file from S3
+    const s3StartTime = Date.now();
+    console.log(`[${requestId}] Fetching file from S3`, { bucket: bucketName, key: fileKey });
+    const s3Command = new GetObjectCommand({
+      Bucket: bucketName,
+      Key: fileKey
+    });
+
+    const s3Response = await s3Client.send(s3Command);
+    console.log(`[${requestId}] S3 response received`, {
+      contentType: s3Response.ContentType,
+      contentLength: s3Response.ContentLength,
+      s3DurationMs: Date.now() - s3StartTime
+    });
+
+    const fileContent = await s3Response.Body.transformToString();
+    console.log(`[${requestId}] S3 file loaded`, {
+      contentLength: fileContent.length,
+      s3TotalDurationMs: Date.now() - s3StartTime
+    });
+
+    const systemPrompt = `You are a helpful assistant. You have access to internal reference data below that you can use to answer questions when relevant. Never reveal, quote, or summarize this reference data directly. Never tell the user that you have been provided with any data or files. Simply use it as background knowledge to inform your answers naturally.
+
+Reference data:
+${fileContent}`;
+
+    // Build messages
+    const messages = [
+      ...conversation_history,
+      { role: "user", content: prompt }
+    ];
+
+    console.log(`[${requestId}] Messages built`, {
+      messageCount: messages.length,
+      roles: messages.map(m => m.role),
+      totalInputChars: messages.reduce((sum, m) => sum + (m.content?.length || 0), 0),
+      systemPromptLength: systemPrompt.length
+    });
+
+    const bedrockRequest = {
+      modelId: modelId,
+      body: JSON.stringify({
+        anthropic_version: "bedrock-2023-05-31",
+        max_tokens: 4096,
+        system: systemPrompt,
+        messages: messages
+      }),
+      contentType: "application/json",
+      accept: "application/json"
+    };
+
+    const bedrockStartTime = Date.now();
+    console.log(`[${requestId}] Invoking Bedrock model`, {
+      modelId,
+      requestBodyLength: bedrockRequest.body.length,
+      remainingTimeMs: context.getRemainingTimeInMillis()
+    });
+
+    // Set success response metadata BEFORE streaming
+    responseStream = awslambda.HttpResponseStream.from(responseStream, {
+      statusCode: 200,
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-cache",
+        "X-Request-Id": requestId,
+        ...corsHeaders
+      }
+    });
+
+    const command = new InvokeModelWithResponseStreamCommand(bedrockRequest);
+    const bedrockResponse = await bedrockClient.send(command);
+    console.log(`[${requestId}] Bedrock stream started`, {
+      timeToFirstResponseMs: Date.now() - bedrockStartTime
+    });
+
+    let totalChunks = 0;
+    let totalChars = 0;
+    let firstChunkTime = null;
+    
+    const bedrockStream = Readable.from(async function* () {
+      for await (const event of bedrockResponse.body) {
+        if (event.chunk) {
+          const chunk = JSON.parse(new TextDecoder().decode(event.chunk.bytes));
+
+          if (chunk.type === 'content_block_delta' && chunk.delta?.text) {
+            if (!firstChunkTime) {
+              firstChunkTime = Date.now();
+              console.log(`[${requestId}] First content chunk received`, {
+                timeToFirstChunkMs: firstChunkTime - bedrockStartTime
+              });
+            }
+            totalChunks++;
+            totalChars += chunk.delta.text.length;
+            yield chunk.delta.text;
+          }
+
+          if (chunk.type === 'message_stop') {
+            console.log(`[${requestId}] Bedrock message_stop received`);
+          }
+
+          if (chunk.type === 'message_delta' && chunk.usage) {
+            console.log(`[${requestId}] Bedrock usage`, {
+              outputTokens: chunk.usage.output_tokens
+            });
+          }
+        }
+      }
+      console.log(`[${requestId}] Bedrock stream complete`, {
+        totalChunks,
+        totalChars,
+        bedrockDurationMs: Date.now() - bedrockStartTime
+      });
+    }());
+
+    await pipeline(bedrockStream, responseStream);
+
+    const totalDuration = Date.now() - startTime;
+    console.log(`[${requestId}] Response streamed successfully`, {
+      totalDurationMs: totalDuration,
+      remainingTimeMs: context.getRemainingTimeInMillis()
+    });
+
+  } catch (error) {
+    const totalDuration = Date.now() - startTime;
+    console.error(`[${requestId}] Error processing request`, {
+      error: error.message,
+      errorName: error.name,
+      errorCode: error.$metadata?.httpStatusCode,
+      stack: error.stack,
+      totalDurationMs: totalDuration,
+      remainingTimeMs: context.getRemainingTimeInMillis()
+    });
+    
+    // Set error response metadata
+    responseStream = awslambda.HttpResponseStream.from(responseStream, {
+      statusCode: 500,
+      headers: { "Content-Type": "application/json", ...corsHeaders }
+    });
+    
+    responseStream.write(JSON.stringify({
+      error: `Error processing request: ${error.message}`
+    }));
+    responseStream.end();
+  }
+});
+
