@@ -34,9 +34,9 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream,
 
   try {
     const knowledgeBaseId = process.env.KNOWLEDGE_BASE_ID;
-    const modelArn = process.env.MODEL_ARN || 'arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0';
+    const modelArn = process.env.MODEL_ID || 'arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-opus-4-6-v1';
 
-    console.log(`[${requestId}] Config`, { knowledgeBaseId, modelArn });
+    console.log(`[${requestId}] Config`, { knowledgeBaseId, modelArn: modelArn });
 
     if (!knowledgeBaseId) {
       console.error(`[${requestId}] Missing KNOWLEDGE_BASE_ID env var`);
