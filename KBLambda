@@ -1,0 +1,172 @@
+
+import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
+import { BedrockAgentRuntimeClient, RetrieveAndGenerateStreamCommand } from '@aws-sdk/client-bedrock-agent-runtime';
+
+const bedrockAgentClient = new BedrockAgentRuntimeClient({});
+
+export const handler = awslambda.streamifyResponse(async (event, responseStream, context) => {
+  const requestId = context.awsRequestId;
+  const startTime = Date.now();
+  console.log(`[${requestId}] Lambda invoked`, {
+    httpMethod: event.httpMethod,
+    path: event.path,
+    sourceIp: event.requestContext?.identity?.sourceIp,
+    userAgent: event.headers?.['User-Agent'],
+    remainingTimeMs: context.getRemainingTimeInMillis()
+  });
+
+  const corsHeaders = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Methods": "POST, OPTIONS"
+  };
+
+  // Handle CORS preflight
+  if (event.httpMethod === 'OPTIONS') {
+    responseStream = awslambda.HttpResponseStream.from(responseStream, {
+      statusCode: 200,
+      headers: { ...corsHeaders }
+    });
+    responseStream.end();
+    return;
+  }
+
+  try {
+    const knowledgeBaseId = process.env.KNOWLEDGE_BASE_ID;
+    const modelArn = process.env.MODEL_ARN || 'arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0';
+
+    console.log(`[${requestId}] Config`, { knowledgeBaseId, modelArn });
+
+    if (!knowledgeBaseId) {
+      console.error(`[${requestId}] Missing KNOWLEDGE_BASE_ID env var`);
+      responseStream = awslambda.HttpResponseStream.from(responseStream, {
+        statusCode: 400,
+        headers: { "Content-Type": "application/json", ...corsHeaders }
+      });
+      responseStream.write(JSON.stringify({
+        error: 'Missing required environment variable: KNOWLEDGE_BASE_ID'
+      }));
+      responseStream.end();
+      return;
+    }
+
+    // Parse request body
+    console.log(`[${requestId}] Parsing request body`, { bodyLength: event.body?.length, isBase64Encoded: event.isBase64Encoded });
+    const body = JSON.parse(event.body || '{}');
+    const { prompt, conversation_history = [] } = body;
+
+    if (!prompt) {
+      console.warn(`[${requestId}] Missing prompt in request body`, { bodyKeys: Object.keys(body) });
+      responseStream = awslambda.HttpResponseStream.from(responseStream, {
+        statusCode: 400,
+        headers: { "Content-Type": "application/json", ...corsHeaders }
+      });
+      responseStream.write(JSON.stringify({
+        error: 'Missing required parameter: prompt'
+      }));
+      responseStream.end();
+      return;
+    }
+
+    console.log(`[${requestId}] Request parsed`, {
+      promptLength: prompt.length,
+      promptPreview: prompt.substring(0, 100),
+      historyLength: conversation_history.length
+    });
+
+    // Build the RetrieveAndGenerateStream command
+    const commandInput = {
+      input: { text: prompt },
+      retrieveAndGenerateConfiguration: {
+        type: "KNOWLEDGE_BASE",
+        knowledgeBaseConfiguration: {
+          knowledgeBaseId: knowledgeBaseId,
+          modelArn: modelArn
+        }
+      }
+    };
+
+    // Include session ID for multi-turn conversations if available
+    if (body.sessionId) {
+      commandInput.sessionId = body.sessionId;
+    }
+
+    const bedrockStartTime = Date.now();
+    console.log(`[${requestId}] Invoking Bedrock Knowledge Base`, {
+      knowledgeBaseId,
+      modelArn,
+      remainingTimeMs: context.getRemainingTimeInMillis()
+    });
+
+    // Set success response metadata BEFORE streaming
+    responseStream = awslambda.HttpResponseStream.from(responseStream, {
+      statusCode: 200,
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-cache",
+        "X-Request-Id": requestId,
+        ...corsHeaders
+      }
+    });
+
+    const command = new RetrieveAndGenerateStreamCommand(commandInput);
+    const bedrockResponse = await bedrockAgentClient.send(command);
+    console.log(`[${requestId}] Knowledge Base stream started`, {
+      timeToFirstResponseMs: Date.now() - bedrockStartTime
+    });
+
+    let totalChunks = 0;
+    let totalChars = 0;
+    let firstChunkTime = null;
+
+    const kbStream = Readable.from(async function* () {
+      for await (const event of bedrockResponse.stream) {
+        if (event.output?.text) {
+          if (!firstChunkTime) {
+            firstChunkTime = Date.now();
+            console.log(`[${requestId}] First content chunk received`, {
+              timeToFirstChunkMs: firstChunkTime - bedrockStartTime
+            });
+          }
+          totalChunks++;
+          totalChars += event.output.text.length;
+          yield event.output.text;
+        }
+      }
+      console.log(`[${requestId}] Knowledge Base stream complete`, {
+        totalChunks,
+        totalChars,
+        bedrockDurationMs: Date.now() - bedrockStartTime
+      });
+    }());
+
+    await pipeline(kbStream, responseStream);
+
+    const totalDuration = Date.now() - startTime;
+    console.log(`[${requestId}] Response streamed successfully`, {
+      totalDurationMs: totalDuration,
+      remainingTimeMs: context.getRemainingTimeInMillis()
+    });
+
+  } catch (error) {
+    const totalDuration = Date.now() - startTime;
+    console.error(`[${requestId}] Error processing request`, {
+      error: error.message,
+      errorName: error.name,
+      errorCode: error.$metadata?.httpStatusCode,
+      stack: error.stack,
+      totalDurationMs: totalDuration,
+      remainingTimeMs: context.getRemainingTimeInMillis()
+    });
+
+    responseStream = awslambda.HttpResponseStream.from(responseStream, {
+      statusCode: 500,
+      headers: { "Content-Type": "application/json", ...corsHeaders }
+    });
+    responseStream.write(JSON.stringify({
+      error: `Error processing request: ${error.message}`
+    }));
+    responseStream.end();
+  }
+});
