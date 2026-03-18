@@ -2,20 +2,30 @@
 AWS Lambda function that scrapes the GMU School of Computing catalog
 and writes structured .txt files to S3 for use as an LLM knowledge base.
 
-Triggered on a schedule via EventBridge (e.g., weekly).
+Features:
+- Scrapes school overview, department overviews, faculty, courses, and program pages
+- Expands manual program coverage
+- Auto-discovers additional program links from department pages
+- Uses retries + session headers
+- Writes clean text files to S3
 """
+
 import os
 import re
 import logging
+from urllib.parse import urljoin, urlparse
+
 import boto3
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ["S3_BUCKET"]
-S3_PREFIX = os.environ.get("S3_PREFIX", "gmu-catalog/")
+S3_PREFIX = os.environ.get("S3_PREFIX", "gmu-catalog/").rstrip("/") + "/"
 BASE_URL = "https://catalog.gmu.edu/colleges-schools/engineering-computing/school-computing"
 
 METADATA = (
@@ -31,18 +41,37 @@ DEPT_PAGES = [
 ]
 
 PROGRAM_PAGES = [
+    # --- Computer Science ---
     (f"{BASE_URL}/computer-science/computer-science-bs/", "programs/cs-bs.txt", "Computer Science, BS"),
     (f"{BASE_URL}/computer-science/applied-computer-science-bs/", "programs/applied-cs-bs.txt", "Applied Computer Science, BS"),
     (f"{BASE_URL}/computer-science/computer-science-ms/", "programs/cs-ms.txt", "Computer Science, MS"),
     (f"{BASE_URL}/computer-science/computer-science-phd/", "programs/cs-phd.txt", "Computer Science, PhD"),
     (f"{BASE_URL}/computer-science/software-engineering-ms/", "programs/swe-ms.txt", "Software Engineering, MS"),
+    (f"{BASE_URL}/computer-science/computer-science-minor/", "programs/cs-minor.txt", "Computer Science Minor"),
+    (f"{BASE_URL}/computer-science/software-engineering-minor/", "programs/swe-minor.txt", "Software Engineering Minor"),
+    (f"{BASE_URL}/computer-science/computer-science-undergraduate-certificate/", "programs/cs-undergrad-cert.txt", "Computer Science Undergraduate Certificate"),
+    (f"{BASE_URL}/computer-science/computing-foundations-graduate-certificate/", "programs/computing-foundations-grad-cert.txt", "Computing Foundations Graduate Certificate"),
+    (f"{BASE_URL}/computer-science/software-engineering-graduate-certificate/", "programs/swe-grad-cert.txt", "Software Engineering Graduate Certificate"),
+    (f"{BASE_URL}/computer-science/information-systems-ms/", "programs/information-systems-ms-cs.txt", "Information Systems, MS (CS)"),
+
+    # --- Information Sciences and Technology ---
     (f"{BASE_URL}/information-sciences-technology/information-technology-bs/", "programs/it-bs.txt", "Information Technology, BS"),
     (f"{BASE_URL}/information-sciences-technology/applied-information-technology-ms/", "programs/ait-ms.txt", "Applied Information Technology, MS"),
-    (f"{BASE_URL}/information-sciences-technology/information-systems-ms/", "programs/infs-ms.txt", "Information Systems, MS"),
+    (f"{BASE_URL}/information-sciences-technology/information-systems-ms/", "programs/infs-ms-ist.txt", "Information Systems, MS (IST)"),
+    (f"{BASE_URL}/information-sciences-technology/information-technology-minor/", "programs/it-minor.txt", "Information Technology Minor"),
+    (f"{BASE_URL}/information-sciences-technology/digital-media-web-design-minor/", "programs/dmwd-minor.txt", "Digital Media and Web Design Minor"),
+    (f"{BASE_URL}/information-sciences-technology/information-technology-undergraduate-certificate/", "programs/it-undergrad-cert.txt", "Information Technology Undergraduate Certificate"),
+    (f"{BASE_URL}/information-sciences-technology/information-sciences-graduate-certificate/", "programs/information-sciences-grad-cert.txt", "Information Sciences Graduate Certificate"),
+    (f"{BASE_URL}/information-sciences-technology/applied-cyber-security-graduate-certificate/", "programs/applied-cyber-security-grad-cert.txt", "Applied Cyber Security Graduate Certificate"),
+
+    # --- Statistics ---
     (f"{BASE_URL}/statistics/statistics-bs/", "programs/stat-bs.txt", "Statistics, BS"),
     (f"{BASE_URL}/statistics/statistical-science-ms/", "programs/stat-science-ms.txt", "Statistical Science, MS"),
     (f"{BASE_URL}/statistics/biostatistics-ms/", "programs/biostatistics-ms.txt", "Biostatistics, MS"),
     (f"{BASE_URL}/statistics/statistical-science-phd/", "programs/stat-science-phd.txt", "Statistical Science, PhD"),
+    (f"{BASE_URL}/statistics/statistics-minor/", "programs/statistics-minor.txt", "Statistics Minor"),
+    (f"{BASE_URL}/statistics/data-analysis-minor/", "programs/data-analysis-minor.txt", "Data Analysis Minor"),
+    (f"{BASE_URL}/statistics/federal-statistical-systems-graduate-certificate/", "programs/federal-stat-systems-grad-cert.txt", "Federal Statistical Systems Graduate Certificate"),
 ]
 
 SUBJECT_NAMES = {
@@ -56,113 +85,276 @@ SUBJECT_NAMES = {
     "STAT": "Statistics",
 }
 
+EXCLUDED_SUFFIXES = {
+    ".pdf",
+}
+
+EXCLUDED_HREF_PREFIXES = (
+    "#",
+    "mailto:",
+    "javascript:",
+)
+
+EXCLUDED_PATH_FRAGMENTS = [
+    "/search/",
+    "/archive/",
+    "/azcourses/",
+]
+
 s3 = boto3.client("s3")
+
+
+# ── HTTP Session ──────────────────────────────────────────────────
+
+def build_session():
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (compatible; GMUCatalogScraper/1.0; +https://aws.amazon.com/lambda/)"
+    })
+    return session
+
+
+http = build_session()
 
 
 # ── Helpers ───────────────────────────────────────────────────────
 
-def put_s3(key, content):
-    """Write a text file to S3."""
+def normalize_text(text: str) -> str:
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def slugify_path(path: str) -> str:
+    cleaned = path.strip("/").replace("/", "-")
+    cleaned = re.sub(r"[^a-zA-Z0-9\-]+", "-", cleaned)
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-").lower()
+    return cleaned
+
+
+def put_s3(key: str, content: str):
     full_key = f"{S3_PREFIX}{key}"
-    s3.put_object(Bucket=S3_BUCKET, Key=full_key, Body=content.encode("utf-8"), ContentType="text/plain")
-    logger.info(f"Uploaded s3://{S3_BUCKET}/{full_key}")
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=full_key,
+        Body=content.encode("utf-8"),
+        ContentType="text/plain; charset=utf-8",
+    )
+    logger.info("Uploaded s3://%s/%s", S3_BUCKET, full_key)
 
 
-def build_file_content(title, source_url, body):
-    return f"{title}\n\nSource: {source_url}\n{METADATA}\n\n{body.strip()}\n"
+def build_file_content(title: str, source_url: str, body: str) -> str:
+    return normalize_text(
+        f"{title}\n\nSource: {source_url}\n{METADATA}\n\n{body}\n"
+    )
 
 
-def fetch_soup(url):
-    resp = requests.get(url, timeout=15)
+def fetch_soup(url: str) -> BeautifulSoup:
+    resp = http.get(url, timeout=20)
     resp.raise_for_status()
     return BeautifulSoup(resp.text, "html.parser")
 
 
+def unique_by_url(items):
+    seen = set()
+    result = []
+    for url, filename, title in items:
+        normalized = url.rstrip("/") + "/"
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append((normalized, filename, title))
+    return result
+
+
 # ── Extractors ────────────────────────────────────────────────────
 
-def extract_overview(soup):
-    text = soup.get_text("\n", strip=True)
-    end = text.find("Department Faculty")
-    if end == -1:
-        end = text.find("Professors\n")
-    if end == -1:
-        end = min(2000, len(text))
-    overview = text[:end].strip()
-    for skip in ["Overview", "Faculty", "Programs", "Courses"]:
-        overview = overview.replace(f"\n{skip}\n", "\n")
-    return overview
-
-
-def extract_faculty(soup):
-    text = soup.get_text("\n", strip=True)
-    start = text.find("Department Faculty")
-    if start == -1:
-        start = text.find("Professors\n")
-    if start == -1:
+def extract_overview(soup: BeautifulSoup) -> str:
+    main = soup.find("main") or soup.find("div", id="content") or soup.body
+    if not main:
         return ""
-    end = text.find("Course Offerings", start)
-    if end == -1:
-        end = text.find("Level Courses", start)
-    if end == -1:
-        end = min(start + 3000, len(text))
+
+    text = main.get_text("\n", strip=True)
+
+    end_markers = [
+        "Department Faculty",
+        "Professors",
+        "Course Offerings",
+        "Programs",
+        "Courses",
+    ]
+
+    end_positions = [text.find(marker) for marker in end_markers if text.find(marker) != -1]
+    end = min(end_positions) if end_positions else min(2000, len(text))
+
+    overview = text[:end].strip()
+    overview = re.sub(r"\bOverview\b", "", overview)
+    return normalize_text(overview)
+
+
+def extract_faculty(soup: BeautifulSoup) -> str:
+    text = soup.get_text("\n", strip=True)
+
+    start_markers = ["Department Faculty", "Professors"]
+    start_positions = [text.find(marker) for marker in start_markers if text.find(marker) != -1]
+    if not start_positions:
+        return ""
+
+    start = min(start_positions)
+
+    end_markers = ["Course Offerings", "Lower Level Courses", "Upper Level Courses", "Graduate Courses"]
+    end_positions = [text.find(marker, start) for marker in end_markers if text.find(marker, start) != -1]
+    end = min(end_positions) if end_positions else min(start + 4000, len(text))
+
     section = text[start:end].strip()
     lines = []
+
     for line in section.split("\n"):
         line = line.strip()
         if not line or line == "Department Faculty":
             continue
-        if any(r in line for r in ["Professors", "Instructors", "Adjunct", "Emeritus", "Affiliated"]):
+        if any(rank in line for rank in ["Professors", "Instructors", "Adjunct", "Emeritus", "Affiliated"]):
             lines.append(f"\n{line}\n")
         else:
             lines.append(line)
-    return "\n".join(lines)
+
+    return normalize_text("\n".join(lines))
 
 
-def extract_program(soup):
+def extract_program(soup: BeautifulSoup) -> str:
     main = soup.find("main") or soup.find("div", id="content") or soup.body
     if not main:
         return ""
-    for tag in main.find_all(["nav", "script", "style"]):
+
+    for tag in main.find_all(["nav", "script", "style", "noscript", "footer", "header"]):
         tag.decompose()
-    return main.get_text("\n", strip=True)
+
+    text = main.get_text("\n", strip=True)
+
+    noise_patterns = [
+        r"Print Options",
+        r"Send Page to Printer",
+        r"Download Page \(PDF\)",
+        r"Return to.*",
+        r"Catalog Navigation",
+        r"Toggle navigation",
+    ]
+    for pattern in noise_patterns:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+
+    return normalize_text(text)
 
 
-def identify_subjects(soup):
+def identify_subjects(soup: BeautifulSoup):
     blocks = soup.find_all("div", class_="courseblock")
     subjects = {}
+
     for block in blocks:
         code_tag = block.find("strong", class_="cb_code")
-        if code_tag:
-            code_text = code_tag.get_text(strip=True).rstrip(":")
-            parts = code_text.split()
-            if len(parts) >= 2:
-                subj = parts[0]
-                if subj not in subjects:
-                    subjects[subj] = []
-                subjects[subj].append(block)
+        if not code_tag:
+            continue
+
+        code_text = code_tag.get_text(strip=True).rstrip(":")
+        parts = code_text.split()
+        if len(parts) < 2:
+            continue
+
+        subj = parts[0]
+        subjects.setdefault(subj, []).append(block)
+
     return subjects
 
 
-def courses_to_text(blocks):
+def courses_to_text(blocks) -> str:
     parts = []
+
     for block in blocks:
         title_div = block.find("div", class_="courseblocktitle")
         desc_div = block.find("div", class_="courseblockdesc")
         if not title_div:
             continue
+
         code_tag = title_div.find("strong", class_="cb_code")
         title_tag = title_div.find("em", class_="cb_title")
+
         code = code_tag.get_text(strip=True).rstrip(":") if code_tag else ""
         title = title_tag.get_text(strip=True).rstrip(".") if title_tag else ""
-        credits_text = title_div.get_text(strip=True)
-        credits_match = re.search(r"(\d[\d\-]*\s+credits?)", credits_text)
+
+        title_text = title_div.get_text(" ", strip=True)
+        credits_match = re.search(r"(\d+(?:-\d+)?\s+credits?)", title_text, re.IGNORECASE)
         credits = credits_match.group(1) if credits_match else ""
+
         desc = desc_div.get_text(" ", strip=True) if desc_div else ""
-        parts.append(f"{code}: {title}")
-        parts.append(f"Credits: {credits}\n")
+
+        entry = [f"{code}: {title}"]
+        if credits:
+            entry.append(f"Credits: {credits}")
         if desc:
-            parts.append(f"{desc}\n")
-    return "\n".join(parts)
+            entry.append(desc)
+
+        parts.append("\n".join(entry))
+
+    return normalize_text("\n\n".join(parts))
+
+
+# ── Auto-discovery ────────────────────────────────────────────────
+
+def discover_program_links(dept_url: str, soup: BeautifulSoup):
+    dept_path = urlparse(dept_url).path.rstrip("/")
+    discovered = []
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        text = a.get_text(" ", strip=True)
+
+        if not href or not text:
+            continue
+
+        if href.startswith(EXCLUDED_HREF_PREFIXES):
+            continue
+
+        full_url = urljoin(dept_url, href)
+        parsed = urlparse(full_url)
+
+        if "catalog.gmu.edu" not in parsed.netloc:
+            continue
+
+        if any(parsed.path.lower().endswith(ext) for ext in EXCLUDED_SUFFIXES):
+            continue
+
+        normalized_path = parsed.path.rstrip("/")
+
+        if any(fragment in normalized_path.lower() for fragment in EXCLUDED_PATH_FRAGMENTS):
+            continue
+
+        # Keep only links inside this department subtree
+        if not normalized_path.startswith(dept_path):
+            continue
+
+        # Skip department page itself
+        if normalized_path == dept_path:
+            continue
+
+        # Skip likely utility links
+        if "print" in normalized_path.lower():
+            continue
+
+        filename = f"programs/{slugify_path(normalized_path)}.txt"
+        cleaned_title = re.sub(r"\s+", " ", text).strip()
+
+        discovered.append((full_url.rstrip("/") + "/", filename, cleaned_title))
+
+    return unique_by_url(discovered)
 
 
 # ── Main handler ──────────────────────────────────────────────────
@@ -171,42 +363,61 @@ def lambda_handler(event, context):
     files_uploaded = 0
     errors = []
 
-    # School overview
+    # 1) School overview
     try:
-        soup = fetch_soup(f"{BASE_URL}/")
+        school_url = f"{BASE_URL}/"
+        soup = fetch_soup(school_url)
         body = extract_overview(soup)
-        put_s3("00-school-of-computing-overview.txt",
-               build_file_content("Long Nguyen and Kimmy Duong School of Computing — Overview",
-                                  f"{BASE_URL}/", body))
-        files_uploaded += 1
+
+        if body:
+            put_s3(
+                "00-school-of-computing-overview.txt",
+                build_file_content(
+                    "Long Nguyen and Kimmy Duong School of Computing — Overview",
+                    school_url,
+                    body,
+                ),
+            )
+            files_uploaded += 1
     except Exception as e:
+        logger.exception("School overview failed")
         errors.append(f"School overview: {e}")
 
-    # Department pages
+    # 2) Department pages + discovery
+    discovered_program_pages = []
+
     for url, slug, name in DEPT_PAGES:
         try:
             soup = fetch_soup(url)
         except Exception as e:
+            logger.exception("Failed fetching %s", name)
             errors.append(f"{name}: {e}")
             continue
 
-        # Overview
+        # Department overview
         try:
             overview = extract_overview(soup)
-            put_s3(f"dept-{slug}-overview.txt",
-                   build_file_content(f"{name} — Overview", url, overview))
-            files_uploaded += 1
+            if overview:
+                put_s3(
+                    f"dept-{slug}-overview.txt",
+                    build_file_content(f"{name} — Overview", url, overview),
+                )
+                files_uploaded += 1
         except Exception as e:
+            logger.exception("%s overview failed", name)
             errors.append(f"{name} overview: {e}")
 
         # Faculty
         try:
             faculty = extract_faculty(soup)
             if faculty:
-                put_s3(f"faculty/{slug}-faculty.txt",
-                       build_file_content(f"{name} — Faculty", url, faculty))
+                put_s3(
+                    f"faculty/{slug}-faculty.txt",
+                    build_file_content(f"{name} — Faculty", url, faculty),
+                )
                 files_uploaded += 1
         except Exception as e:
+            logger.exception("%s faculty failed", name)
             errors.append(f"{name} faculty: {e}")
 
         # Courses by subject
@@ -215,26 +426,47 @@ def lambda_handler(event, context):
             for subj_code, blocks in subjects.items():
                 subj_name = SUBJECT_NAMES.get(subj_code, subj_code)
                 content = courses_to_text(blocks)
-                put_s3(f"courses/{subj_code.lower()}-courses.txt",
-                       build_file_content(f"{subj_name} ({subj_code}) — Course Catalog", url, content))
+                if not content:
+                    continue
+
+                put_s3(
+                    f"courses/{subj_code.lower()}-courses.txt",
+                    build_file_content(f"{subj_name} ({subj_code}) — Course Catalog", url, content),
+                )
                 files_uploaded += 1
-                logger.info(f"  {subj_code}: {len(blocks)} courses")
+                logger.info("%s: %s courses", subj_code, len(blocks))
         except Exception as e:
+            logger.exception("%s courses failed", name)
             errors.append(f"{name} courses: {e}")
 
-    # Program pages
-    for url, filename, name in PROGRAM_PAGES:
+        # Auto-discovered program links
+        try:
+            auto_links = discover_program_links(url, soup)
+            discovered_program_pages.extend(auto_links)
+            logger.info("%s: discovered %s program links", name, len(auto_links))
+        except Exception as e:
+            logger.exception("%s discovery failed", name)
+            errors.append(f"{name} discovery: {e}")
+
+    # 3) Merge manual + discovered program pages
+    all_program_pages = unique_by_url(PROGRAM_PAGES + discovered_program_pages)
+
+    # 4) Program pages
+    for url, filename, name in all_program_pages:
         try:
             soup = fetch_soup(url)
             body = extract_program(soup)
-            put_s3(filename, build_file_content(name, url, body))
-            files_uploaded += 1
+            if body:
+                put_s3(filename, build_file_content(name, url, body))
+                files_uploaded += 1
         except requests.exceptions.HTTPError as e:
             if "404" in str(e):
-                logger.warning(f"Skipped {name} (404)")
+                logger.warning("Skipped %s (404): %s", name, url)
             else:
+                logger.exception("%s failed", name)
                 errors.append(f"{name}: {e}")
         except Exception as e:
+            logger.exception("%s failed", name)
             errors.append(f"{name}: {e}")
 
     result = {
@@ -242,8 +474,11 @@ def lambda_handler(event, context):
         "errors": errors,
         "bucket": S3_BUCKET,
         "prefix": S3_PREFIX,
+        "program_pages_total": len(all_program_pages),
     }
-    logger.info(f"Done: {files_uploaded} files uploaded, {len(errors)} errors")
+
+    logger.info("Done: %s files uploaded, %s errors", files_uploaded, len(errors))
     if errors:
-        logger.error(f"Errors: {errors}")
+        logger.error("Errors: %s", errors)
+
     return result
